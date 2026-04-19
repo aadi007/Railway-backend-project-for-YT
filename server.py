@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Header
 from dotenv import load_dotenv
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
@@ -167,6 +168,13 @@ async def get_profile(authorization: Optional[str] = Header(None)):
 
 
 app.include_router(api_router)
+app.include_router(api_router)
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["*"],
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -174,3 +182,5 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
