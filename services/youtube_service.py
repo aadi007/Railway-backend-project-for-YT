@@ -1,7 +1,11 @@
 import re
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import logging
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound
+)
 
 logger = logging.getLogger(__name__)
 
@@ -11,10 +15,7 @@ class YouTubeService:
     @staticmethod
     def extract_video_id(url: str) -> Optional[str]:
         patterns = [
-            r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtu\.be/([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]{11})'
+            r'(?:v=|\/)([0-9A-Za-z_-]{11}).*'
         ]
         for pattern in patterns:
             match = re.search(pattern, url)
@@ -25,11 +26,26 @@ class YouTubeService:
     @staticmethod
     def get_transcript(video_id: str, language: str = 'en') -> Optional[str]:
         try:
-            # Fetch transcript using youtube-transcript-api
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
+            # 🔥 Get ALL available transcripts (not just strict language)
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-            # Combine all text
-            full_text = " ".join([item['text'] for item in transcript])
+            try:
+                # ✅ Try exact language first
+                transcript = transcript_list.find_transcript([language])
+            except:
+                try:
+                    # ✅ Fallback to English variants
+                    transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
+                except:
+                    # ✅ FINAL fallback → auto-generated transcript
+                    transcript = transcript_list.find_generated_transcript(['en'])
+
+            transcript_data = transcript.fetch()
+
+            # Combine text
+            full_text = " ".join([item['text'] for item in transcript_data])
+
+            logger.info(f"Transcript fetched successfully for {video_id}, length: {len(full_text)}")
 
             return full_text
 
@@ -37,24 +53,41 @@ class YouTubeService:
             logger.error(f"Transcripts disabled for video {video_id}")
             return None
 
+        except NoTranscriptFound:
+            logger.error(f"No transcript found for video {video_id}")
+            return None
+
         except Exception as e:
-            logger.error(f"Error fetching transcript for {video_id}: {e}")
+            logger.error(f"Transcript fetch error for {video_id}: {e}")
+            return None
+
+    @staticmethod
+    def get_transcript_with_timestamps(video_id: str, language: str = 'en') -> Optional[List[Dict]]:
+        """
+        🔥 NEW: Returns transcript WITH timestamps (for accurate chapters)
+        """
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+            try:
+                transcript = transcript_list.find_transcript([language])
+            except:
+                try:
+                    transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
+                except:
+                    transcript = transcript_list.find_generated_transcript(['en'])
+
+            return transcript.fetch()
+
+        except Exception as e:
+            logger.error(f"Timestamp transcript error: {e}")
             return None
 
     @staticmethod
     async def get_video_info(video_id: str) -> Dict:
-        try:
-            # Since yt-dlp is removed, keep minimal info
-            return {
-                'video_id': video_id,
-                'video_url': f'https://www.youtube.com/watch?v={video_id}',
-                'title': f'YouTube Video {video_id}',
-                'duration': 0
-            }
-
-        except Exception as e:
-            logger.error(f"Error fetching video info for {video_id}: {e}")
-            return {
-                'video_id': video_id,
-                'video_url': f'https://www.youtube.com/watch?v={video_id}'
-            }
+        return {
+            'video_id': video_id,
+            'video_url': f'https://www.youtube.com/watch?v={video_id}',
+            'title': f'YouTube Video {video_id}',
+            'duration': 0
+        }
