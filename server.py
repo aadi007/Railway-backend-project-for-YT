@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, List
+import asyncio  # ✅ NEW
 
 from services.youtube_service import YouTubeService
 from services.ai_service import AIService
@@ -103,8 +104,12 @@ async def generate(request: GenerateRequest, authorization: Optional[str] = Head
         video_url = video_info['video_url']
         video_title = video_info.get('title', f'YouTube Video {video_id}')
 
-        # ❗ FIXED: Removed await (function is sync now)
-        transcript = youtube_service.get_transcript(video_id, request.lang)
+        # ✅ FIX: Run sync function safely in async (prevents blocking)
+        transcript = await asyncio.to_thread(
+            youtube_service.get_transcript,
+            video_id,
+            request.lang
+        )
 
         if not transcript:
             return GenerateResponse(
@@ -112,10 +117,10 @@ async def generate(request: GenerateRequest, authorization: Optional[str] = Head
                 error="This video has no captions or is restricted. Please try another video."
             )
 
-        # ✅ LIMIT transcript size (cost optimization)
-        transcript = transcript[:3000]
-
         logger.info(f"Transcript length: {len(transcript)}")
+
+        # ❗ IMPORTANT: DO NOT LIMIT transcript anymore
+        # (AI service now handles chunking internally)
 
         # Generate AI content
         generated_content = await ai_service.generate_content(
@@ -125,7 +130,10 @@ async def generate(request: GenerateRequest, authorization: Optional[str] = Head
         )
 
         if not generated_content:
-            return GenerateResponse(success=False, error="Failed to generate content. Please try again.")
+            return GenerateResponse(
+                success=False,
+                error="Failed to generate content. Please try again."
+            )
 
         timestamps = [
             Timestamp(time=ts['time'], title=ts['title'])
