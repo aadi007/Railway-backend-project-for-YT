@@ -1,3 +1,6 @@
+@app.get("/")
+async def home():
+    return {"status": "API is live"}
 from fastapi import FastAPI, APIRouter, HTTPException, Header
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
