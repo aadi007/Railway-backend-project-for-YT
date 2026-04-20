@@ -23,7 +23,7 @@ class YouTubeService:
         return None
 
     @staticmethod
-    async def get_transcript(video_id: str, language: str = 'en') -> Optional[str]:
+    def get_transcript(video_id: str, language: str = 'en') -> Optional[str]:
         try:
             # Fetch transcript using youtube-transcript-api
             transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
