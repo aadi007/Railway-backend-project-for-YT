@@ -11,9 +11,11 @@ from services.youtube_service import YouTubeService
 from services.ai_service import AIService
 from services.supabase_service import SupabaseService
 
+# Load env
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# Initialize services
 youtube_service = YouTubeService()
 ai_service = AIService(api_key=os.getenv('OPENAI_API_KEY'))
 supabase_service = SupabaseService(
@@ -21,11 +23,16 @@ supabase_service = SupabaseService(
     key=os.getenv('SUPABASE_ANON_KEY')
 )
 
+# App setup
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# =======================
+# Models
+# =======================
 
 class GenerateRequest(BaseModel):
     url: str
@@ -56,6 +63,10 @@ class HistoryResponse(BaseModel):
     success: bool
     history: List[HistoryItem] = []
 
+# =======================
+# Auth helper
+# =======================
+
 async def get_user_from_token(authorization: Optional[str]) -> Optional[dict]:
     if not authorization:
         return None
@@ -66,41 +77,99 @@ async def get_user_from_token(authorization: Optional[str]) -> Optional[dict]:
         logger.error(f"Token error: {e}")
         return None
 
+# =======================
+# Routes
+# =======================
+
 @api_router.get("/")
 async def root():
     return {"message": "YouTube Timestamp & SEO API", "status": "running"}
+
 
 @api_router.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest, authorization: Optional[str] = Header(None)):
     try:
         user = await get_user_from_token(authorization)
+
+        # Extract video ID
         video_id = youtube_service.extract_video_id(request.url)
         if not video_id:
             return GenerateResponse(success=False, error="Invalid YouTube URL")
+
         logger.info(f"Processing video: {video_id}")
+
+        # Get video info
         video_info = await youtube_service.get_video_info(video_id)
         video_url = video_info['video_url']
         video_title = video_info.get('title', f'YouTube Video {video_id}')
-        transcript = await youtube_service.get_transcript(video_id, request.lang)
+
+        # ❗ FIXED: Removed await (function is sync now)
+        transcript = youtube_service.get_transcript(video_id, request.lang)
+
         if not transcript:
-            return GenerateResponse(success=False, error="No transcript available. Try a video with captions enabled.")
-        generated_content = await ai_service.generate_content(transcript=transcript, tone=request.tone, language=request.lang)
+            return GenerateResponse(
+                success=False,
+                error="This video has no captions or is restricted. Please try another video."
+            )
+
+        # ✅ LIMIT transcript size (cost optimization)
+        transcript = transcript[:3000]
+
+        logger.info(f"Transcript length: {len(transcript)}")
+
+        # Generate AI content
+        generated_content = await ai_service.generate_content(
+            transcript=transcript,
+            tone=request.tone,
+            language=request.lang
+        )
+
         if not generated_content:
             return GenerateResponse(success=False, error="Failed to generate content. Please try again.")
-        timestamps = [Timestamp(time=ts['time'], title=ts['title']) for ts in generated_content.get('timestamps', [])]
+
+        timestamps = [
+            Timestamp(time=ts['time'], title=ts['title'])
+            for ts in generated_content.get('timestamps', [])
+        ]
+
         usage_remaining = None
+
+        # Save user data if logged in
         if user:
-            await supabase_service.log_generation(user_id=user['id'], video_url=video_url, video_title=video_title)
+            await supabase_service.log_generation(
+                user_id=user['id'],
+                video_url=video_url,
+                video_title=video_title
+            )
+
             await supabase_service.increment_usage(user['id'])
-            profile = await supabase_service.get_or_create_profile(user['id'], user['email'])
+
+            profile = await supabase_service.get_or_create_profile(
+                user['id'],
+                user['email']
+            )
+
             if profile:
                 usage_remaining = profile.get('usage_count', 0)
-        return GenerateResponse(success=True, video_title=video_title, video_url=video_url, timestamps=timestamps,
-            description=generated_content.get('description', ''), tags=generated_content.get('tags', []),
-            hashtags=generated_content.get('hashtags', []), usage_remaining=usage_remaining)
+
+        return GenerateResponse(
+            success=True,
+            video_title=video_title,
+            video_url=video_url,
+            timestamps=timestamps,
+            description=generated_content.get('description', ''),
+            tags=generated_content.get('tags', []),
+            hashtags=generated_content.get('hashtags', []),
+            usage_remaining=usage_remaining
+        )
+
     except Exception as e:
         logger.error(f"Generate error: {e}", exc_info=True)
-        return GenerateResponse(success=False, error=f"An error occurred: {str(e)}")
+        return GenerateResponse(
+            success=False,
+            error=f"An error occurred: {str(e)}"
+        )
+
 
 @api_router.get("/history", response_model=HistoryResponse)
 async def get_history(authorization: Optional[str] = Header(None)):
@@ -108,13 +177,25 @@ async def get_history(authorization: Optional[str] = Header(None)):
         user = await get_user_from_token(authorization)
         if not user:
             raise HTTPException(status_code=401, detail="Unauthorized")
+
         history_data = await supabase_service.get_user_history(user['id'])
-        history_items = [HistoryItem(video_url=item['video_url'], video_title=item['video_title'], created_at=item['created_at']) for item in history_data]
+
+        history_items = [
+            HistoryItem(
+                video_url=item['video_url'],
+                video_title=item['video_title'],
+                created_at=item['created_at']
+            )
+            for item in history_data
+        ]
+
         return HistoryResponse(success=True, history=history_items)
+
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         return HistoryResponse(success=False, history=[])
+
 
 @api_router.get("/profile")
 async def get_profile(authorization: Optional[str] = Header(None)):
@@ -122,18 +203,34 @@ async def get_profile(authorization: Optional[str] = Header(None)):
         user = await get_user_from_token(authorization)
         if not user:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        profile = await supabase_service.get_or_create_profile(user['id'], user['email'])
+
+        profile = await supabase_service.get_or_create_profile(
+            user['id'],
+            user['email']
+        )
+
         if not profile:
             raise HTTPException(status_code=404, detail="Profile not found")
-        return {"success": True, "profile": {"email": profile['email'], "plan": profile['plan'], "usage_count": profile['usage_count']}}
+
+        return {
+            "success": True,
+            "profile": {
+                "email": profile['email'],
+                "plan": profile['plan'],
+                "usage_count": profile['usage_count']
+            }
+        }
+
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
 
+
+# Register routes
 app.include_router(api_router)
 
-# Allow ALL origins - required for Chrome extension
+# CORS (needed for Chrome extension)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
