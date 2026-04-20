@@ -1,6 +1,3 @@
-@app.get("/")
-async def home():
-    return {"status": "API is live"}
 from fastapi import FastAPI, APIRouter, HTTPException, Header
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -9,7 +6,7 @@ import logging
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, List
-import asyncio  # ✅ NEW
+import asyncio
 
 from services.youtube_service import YouTubeService
 from services.ai_service import AIService
@@ -29,6 +26,13 @@ supabase_service = SupabaseService(
 
 # App setup
 app = FastAPI()
+
+# ✅ GLOBAL ROOT ROUTE (fixes Railway "Not Found")
+@app.get("/")
+async def home():
+    return {"status": "API is live"}
+
+# API router
 api_router = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO)
@@ -85,6 +89,8 @@ async def get_user_from_token(authorization: Optional[str]) -> Optional[dict]:
 # Routes
 # =======================
 
+# ✅ Supports both /api and /api/
+@api_router.get("")
 @api_router.get("/")
 async def root():
     return {"message": "YouTube Timestamp & SEO API", "status": "running"}
@@ -107,7 +113,7 @@ async def generate(request: GenerateRequest, authorization: Optional[str] = Head
         video_url = video_info['video_url']
         video_title = video_info.get('title', f'YouTube Video {video_id}')
 
-        # ✅ FIX: Run sync function safely in async (prevents blocking)
+        # ✅ Run sync function safely (non-blocking)
         transcript = await asyncio.to_thread(
             youtube_service.get_transcript,
             video_id,
@@ -122,10 +128,7 @@ async def generate(request: GenerateRequest, authorization: Optional[str] = Head
 
         logger.info(f"Transcript length: {len(transcript)}")
 
-        # ❗ IMPORTANT: DO NOT LIMIT transcript anymore
-        # (AI service now handles chunking internally)
-
-        # Generate AI content
+        # ✅ No manual trimming (AI handles chunking)
         generated_content = await ai_service.generate_content(
             transcript=transcript,
             tone=request.tone,
@@ -241,7 +244,7 @@ async def get_profile(authorization: Optional[str] = Header(None)):
 # Register routes
 app.include_router(api_router)
 
-# CORS (needed for Chrome extension)
+# CORS (for Chrome extension)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
