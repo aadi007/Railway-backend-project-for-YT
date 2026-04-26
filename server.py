@@ -3,45 +3,40 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
+import asyncio
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, List
-import asyncio
 
 from services.youtube_service import YouTubeService
+from services.chunking_engine import ChunkingEngine
 from services.ai_service import AIService
 from services.supabase_service import SupabaseService
 
-# Load env
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# Initialize services
+# ── Services ──────────────────────────────────────────────
 youtube_service = YouTubeService()
-ai_service = AIService(api_key=os.getenv('OPENAI_API_KEY'))
+chunking_engine = ChunkingEngine()
+ai_service      = AIService(api_key=os.getenv('OPENAI_API_KEY'))
 supabase_service = SupabaseService(
     url=os.getenv('SUPABASE_URL'),
     key=os.getenv('SUPABASE_ANON_KEY')
 )
 
-# App setup
-app = FastAPI()
-
-# ✅ GLOBAL ROOT ROUTE (fixes Railway "Not Found")
-@app.get("/")
-async def home():
-    return {"status": "API is live"}
-
-# API router
+# ── App ───────────────────────────────────────────────────
+app = FastAPI(title="YouTube SEO Generator API", version="2.0.0")
 api_router = APIRouter(prefix="/api")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# =======================
-# Models
-# =======================
 
+# ── Models ────────────────────────────────────────────────
 class GenerateRequest(BaseModel):
     url: str
     tone: str = "professional"
@@ -59,6 +54,7 @@ class GenerateResponse(BaseModel):
     description: str = ""
     tags: List[str] = []
     hashtags: List[str] = []
+    title_suggestions: List[str] = []
     usage_remaining: Optional[int] = None
     error: Optional[str] = None
 
@@ -71,118 +67,126 @@ class HistoryResponse(BaseModel):
     success: bool
     history: List[HistoryItem] = []
 
-# =======================
-# Auth helper
-# =======================
 
+# ── Auth helper ───────────────────────────────────────────
 async def get_user_from_token(authorization: Optional[str]) -> Optional[dict]:
     if not authorization:
         return None
     try:
-        token = authorization.replace("Bearer ", "")
+        token = authorization.replace("Bearer ", "").strip()
         return await supabase_service.verify_user(token)
     except Exception as e:
         logger.error(f"Token error: {e}")
         return None
 
-# =======================
-# Routes
-# =======================
 
-# ✅ Supports both /api and /api/
+# ── Routes ────────────────────────────────────────────────
+@app.get("/")
+async def home():
+    return {"message": "YouTube SEO Generator API", "status": "running", "version": "2.0.0"}
+
 @api_router.get("")
 @api_router.get("/")
 async def root():
-    return {"message": "YouTube Timestamp & SEO API", "status": "running"}
+    return {"message": "YouTube SEO Generator API", "status": "running", "version": "2.0.0"}
 
 
 @api_router.post("/generate", response_model=GenerateResponse)
-async def generate(request: GenerateRequest, authorization: Optional[str] = Header(None)):
+async def generate(
+    request: GenerateRequest,
+    authorization: Optional[str] = Header(None)
+):
     try:
+        # 1. Auth (optional — works without login for free tier)
         user = await get_user_from_token(authorization)
+        logger.info(f"Request from {'user:' + user['email'] if user else 'anonymous'}")
 
-        # Extract video ID
-        video_id = youtube_service.extract_video_id(request.url)
+        # 2. Extract video ID
+        video_id = YouTubeService.extract_video_id(request.url)
         if not video_id:
-            return GenerateResponse(success=False, error="Invalid YouTube URL")
+            return GenerateResponse(success=False, error="Invalid YouTube URL. Please paste a valid YouTube video link.")
 
         logger.info(f"Processing video: {video_id}")
 
-        # Get video info
-        video_info = await youtube_service.get_video_info(video_id)
-        video_url = video_info['video_url']
-        video_title = video_info.get('title', f'YouTube Video {video_id}')
-
-        # ✅ Run sync function safely (non-blocking)
-        transcript = await asyncio.to_thread(
-            youtube_service.get_transcript,
+        # 3. Fetch transcript WITH real timestamps (runs in thread to avoid blocking)
+        transcript_data = await asyncio.to_thread(
+            YouTubeService.get_transcript_with_timestamps,
             video_id,
             request.lang
         )
 
-        if not transcript:
+        if not transcript_data:
             return GenerateResponse(
                 success=False,
-                error="This video has no captions or is restricted. Please try another video."
+                error="No captions available for this video. Please try a video with subtitles/captions enabled."
             )
 
-        logger.info(f"Transcript length: {len(transcript)}")
+        logger.info(f"Transcript segments: {len(transcript_data)}")
 
-        # ✅ No manual trimming (AI handles chunking)
-        generated_content = await ai_service.generate_content(
-            transcript=transcript,
+        # 4. Get video title
+        video_info = await asyncio.to_thread(YouTubeService.get_video_info, video_id)
+        video_title = video_info.get('title', f'YouTube Video {video_id}')
+        video_url   = video_info.get('url', f'https://www.youtube.com/watch?v={video_id}')
+
+        # 5. Chunking engine — segment transcript into logical chapters
+        chunks = chunking_engine.segment(transcript_data)
+        logger.info(f"Chunks created: {len(chunks)}")
+
+        # 6. Build plain text for AI (use chunked summary)
+        plain_transcript = ChunkingEngine.to_plain_text(transcript_data)
+
+        # 7. AI generation
+        generated = await ai_service.generate_content(
+            transcript=plain_transcript,
+            chunks=chunks,
             tone=request.tone,
-            language=request.lang
+            language=request.lang,
+            video_title=video_title
         )
 
-        if not generated_content:
-            return GenerateResponse(
-                success=False,
-                error="Failed to generate content. Please try again."
-            )
+        if not generated:
+            return GenerateResponse(success=False, error="Failed to generate content. Please try again.")
 
-        timestamps = [
-            Timestamp(time=ts['time'], title=ts['title'])
-            for ts in generated_content.get('timestamps', [])
-        ]
+        # 8. Build timestamps — prefer real ones from chunking engine
+        real_timestamps = chunking_engine.build_timestamps(chunks)
+        ai_timestamps   = generated.get('timestamps', [])
 
+        # Use real timestamps if we got enough, otherwise use AI ones
+        if len(real_timestamps) >= 3:
+            timestamps = [Timestamp(time=t['time'], title=t['title']) for t in real_timestamps]
+        else:
+            timestamps = [Timestamp(time=t['time'], title=t['title']) for t in ai_timestamps]
+
+        # 9. Log usage if authenticated
         usage_remaining = None
-
-        # Save user data if logged in
         if user:
             await supabase_service.log_generation(
                 user_id=user['id'],
                 video_url=video_url,
                 video_title=video_title
             )
-
             await supabase_service.increment_usage(user['id'])
-
-            profile = await supabase_service.get_or_create_profile(
-                user['id'],
-                user['email']
-            )
-
+            profile = await supabase_service.get_or_create_profile(user['id'], user['email'])
             if profile:
                 usage_remaining = profile.get('usage_count', 0)
+
+        logger.info(f"Successfully generated content for {video_id}")
 
         return GenerateResponse(
             success=True,
             video_title=video_title,
             video_url=video_url,
             timestamps=timestamps,
-            description=generated_content.get('description', ''),
-            tags=generated_content.get('tags', []),
-            hashtags=generated_content.get('hashtags', []),
+            description=generated.get('description', ''),
+            tags=generated.get('tags', []),
+            hashtags=generated.get('hashtags', []),
+            title_suggestions=generated.get('title_suggestions', []),
             usage_remaining=usage_remaining
         )
 
     except Exception as e:
         logger.error(f"Generate error: {e}", exc_info=True)
-        return GenerateResponse(
-            success=False,
-            error=f"An error occurred: {str(e)}"
-        )
+        return GenerateResponse(success=False, error=f"An error occurred: {str(e)}")
 
 
 @api_router.get("/history", response_model=HistoryResponse)
@@ -191,23 +195,19 @@ async def get_history(authorization: Optional[str] = Header(None)):
         user = await get_user_from_token(authorization)
         if not user:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
         history_data = await supabase_service.get_user_history(user['id'])
-
-        history_items = [
+        items = [
             HistoryItem(
                 video_url=item['video_url'],
                 video_title=item['video_title'],
                 created_at=item['created_at']
-            )
-            for item in history_data
+            ) for item in history_data
         ]
-
-        return HistoryResponse(success=True, history=history_items)
-
+        return HistoryResponse(success=True, history=items)
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.error(f"History error: {e}")
         return HistoryResponse(success=False, history=[])
 
 
@@ -217,34 +217,27 @@ async def get_profile(authorization: Optional[str] = Header(None)):
         user = await get_user_from_token(authorization)
         if not user:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
-        profile = await supabase_service.get_or_create_profile(
-            user['id'],
-            user['email']
-        )
-
+        profile = await supabase_service.get_or_create_profile(user['id'], user['email'])
         if not profile:
             raise HTTPException(status_code=404, detail="Profile not found")
-
         return {
             "success": True,
             "profile": {
                 "email": profile['email'],
-                "plan": profile['plan'],
-                "usage_count": profile['usage_count']
+                "plan": profile.get('plan', 'free'),
+                "usage_count": profile.get('usage_count', 0)
             }
         }
-
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.error(f"Profile error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-# Register routes
+# ── Register ──────────────────────────────────────────────
 app.include_router(api_router)
 
-# CORS (for Chrome extension)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
